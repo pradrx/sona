@@ -1,4 +1,4 @@
 discord.py[voice]>=2.4,<3
+newrelic
 yt-dlp>=2025.1.0
 python-dotenv>=1.0,<2
-
