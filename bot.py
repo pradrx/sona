@@ -17,7 +17,10 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 LOGGER = logging.getLogger("sona")
 
 YTDL_OPTIONS = {
@@ -81,24 +84,35 @@ class Music(commands.Cog):
         voice = interaction.guild.voice_client
         if voice is None:
             voice = await member.voice.channel.connect()
+            LOGGER.info("Joined voice channel %s in guild %s", voice.channel, interaction.guild.id)
         elif voice.channel != member.voice.channel:
+            previous_channel = voice.channel
             await voice.move_to(member.voice.channel)
+            LOGGER.info(
+                "Moved from voice channel %s to %s in guild %s",
+                previous_channel,
+                voice.channel,
+                interaction.guild.id,
+            )
         return voice
 
     async def _play_next(self, guild_id: int) -> None:
         """Start the next queued track. This is also called from FFmpeg's callback."""
         guild = self.bot.get_guild(guild_id)
         if guild is None:
+            LOGGER.warning("Unable to play next track because guild %s is unavailable", guild_id)
             return
 
         player = self.players[guild_id]
         async with player.lock:
             voice = guild.voice_client
             if voice is None or voice.is_playing() or voice.is_paused():
+                LOGGER.debug("Playback is not ready to advance in guild %s", guild_id)
                 return
 
             if not player.queue:
                 player.current = None
+                LOGGER.info("Queue is empty in guild %s", guild_id)
                 return
 
             track = player.queue.popleft()
@@ -111,6 +125,7 @@ class Music(commands.Cog):
                     options=FFMPEG_OPTIONS,
                 )
                 voice.play(source, after=self._after_track(guild_id))
+                LOGGER.info("Started playing '%s' in guild %s", track.title, guild_id)
             except Exception:
                 player.current = None
                 LOGGER.exception("Unable to start playback in guild %s", guild_id)
@@ -119,6 +134,8 @@ class Music(commands.Cog):
         def after(error: Exception | None) -> None:
             if error:
                 LOGGER.error("Playback error in guild %s: %s", guild_id, error)
+            else:
+                LOGGER.info("Track finished in guild %s", guild_id)
             if self.loop is not None and not self.loop.is_closed():
                 future = asyncio.run_coroutine_threadsafe(self._play_next(guild_id), self.loop)
                 future.add_done_callback(self._log_background_error)
@@ -136,6 +153,7 @@ class Music(commands.Cog):
     @app_commands.describe(url="A YouTube video URL")
     async def play(self, interaction: discord.Interaction, url: str) -> None:
         self.loop = asyncio.get_running_loop()
+        LOGGER.info("Play requested by %s", interaction.user.display_name)
         await interaction.response.defer(thinking=True)
 
         try:
@@ -154,6 +172,12 @@ class Music(commands.Cog):
         assert interaction.guild is not None
         player = self.players[interaction.guild.id]
         player.queue.append(track)
+        LOGGER.info(
+            "Queued '%s' in guild %s for %s",
+            track.title,
+            interaction.guild.id,
+            interaction.user.display_name,
+        )
         await self._play_next(interaction.guild.id)
 
         position = len(player.queue) + (1 if player.current else 0)
@@ -174,6 +198,8 @@ class Music(commands.Cog):
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
             return
         voice.stop()
+        assert interaction.guild is not None
+        LOGGER.info("Skipped track in guild %s", interaction.guild.id)
         await interaction.response.send_message("Skipped.")
 
     @app_commands.command(name="pause", description="Pause the current track")
@@ -183,6 +209,8 @@ class Music(commands.Cog):
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
             return
         voice.pause()
+        assert interaction.guild is not None
+        LOGGER.info("Paused playback in guild %s", interaction.guild.id)
         await interaction.response.send_message("Paused.")
 
     @app_commands.command(name="resume", description="Resume the current track")
@@ -192,6 +220,8 @@ class Music(commands.Cog):
             await interaction.response.send_message("Nothing is paused.", ephemeral=True)
             return
         voice.resume()
+        assert interaction.guild is not None
+        LOGGER.info("Resumed playback in guild %s", interaction.guild.id)
         await interaction.response.send_message("Resumed.")
 
     @app_commands.command(name="queue", description="Show the queued tracks")
@@ -204,6 +234,7 @@ class Music(commands.Cog):
         if player.current:
             lines.append(f"Now playing: **{player.current.title}**")
         lines.extend(f"{index}. {track.title}" for index, track in enumerate(player.queue, start=1))
+        LOGGER.info("Queue viewed in guild %s", interaction.guild.id)
         await interaction.response.send_message("\n".join(lines) if lines else "The queue is empty.")
 
     @app_commands.command(name="stop", description="Stop playback and clear the queue")
@@ -217,6 +248,7 @@ class Music(commands.Cog):
         voice = interaction.guild.voice_client
         if voice and (voice.is_playing() or voice.is_paused()):
             voice.stop()
+        LOGGER.info("Stopped playback and cleared queue in guild %s", interaction.guild.id)
         await interaction.response.send_message("Stopped and cleared the queue.")
 
     @app_commands.command(name="leave", description="Leave voice and clear the queue")
@@ -226,6 +258,7 @@ class Music(commands.Cog):
             return
         self.players.pop(interaction.guild.id, None)
         await interaction.guild.voice_client.disconnect()
+        LOGGER.info("Left voice channel and cleared queue in guild %s", interaction.guild.id)
         await interaction.response.send_message("Disconnected and cleared the queue.")
 
 
@@ -233,14 +266,21 @@ class SonaBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.add_cog(Music(self))
         await self.tree.sync()
+        LOGGER.info("Discord commands synchronized")
+
+    async def on_ready(self) -> None:
+        LOGGER.info("Sona is ready as %s", self.user)
 
 
 def main() -> None:
     load_dotenv()
+    LOGGER.info("Starting Sona")
     token = os.getenv("DISCORD_TOKEN")
     if not token or token == "replace-me":
+        LOGGER.critical("DISCORD_TOKEN is not configured")
         raise RuntimeError("Set DISCORD_TOKEN in your .env file before starting the bot.")
     if shutil.which("ffmpeg") is None:
+        LOGGER.critical("FFmpeg was not found on PATH")
         raise RuntimeError(
             "FFmpeg is required but was not found on PATH. Install it, then try again."
         )
